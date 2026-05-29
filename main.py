@@ -19,6 +19,7 @@ from nodes.generator import SolarGenerator, ThermalGenerator, WindGenerator
 from nodes.storage import BatteryStorage
 from simulation import Simulation
 from utils.demand_profiles import DemandProfile
+from visualization import plot_supply_demand, plot_all
 
 
 def build_default_scenario() -> Simulation:
@@ -161,6 +162,19 @@ def main():
         default=False,
         help="Print daily progress",
     )
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        default=False,
+        help="Display visualization plots after simulation (blocks until closed)",
+    )
+    parser.add_argument(
+        "--save-plots",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="Save plots to the specified directory instead of displaying",
+    )
     args = parser.parse_args()
 
     sim = build_default_scenario()
@@ -186,6 +200,14 @@ def main():
     sim.run(start, end, verbose=args.verbose)
 
     sim.print_summary()
+
+    if args.plot:
+        print("\nGenerating visualizations...")
+        plot_all(sim.result)
+    elif args.save_plots:
+        from visualization import save_all
+        print("\nSaving visualizations...")
+        save_all(sim.result, args.save_plots)
 
     print("\nTip: Use --days 365 for a full year, --seed 42 for reproducibility")
     print("     Add --verbose for daily progress output")

@@ -89,6 +89,9 @@ class Simulation:
         self.result = SimulationResult()
         self.price_ema_alpha = price_ema_alpha
         self._expected_price: float | None = None
+        self._current: datetime | None = None
+        self._ctx: TimeContext | None = None
+        self._last_result: MarketResult | None = None
 
         if seed is not None:
             random.seed(seed)
@@ -177,6 +180,96 @@ class Simulation:
             step_num += 1
 
         return self.result
+
+    def reset(self, start: datetime, end: datetime, step: timedelta = timedelta(hours=1)) -> None:
+        """Re-initialize simulation to run from start to end."""
+        self._expected_price = None
+        self._current = start
+        self._end = end
+        self._step = step
+        self._last_result = None
+        self.result = SimulationResult()
+
+    @property
+    def total_steps(self) -> int:
+        if self._current is None or self._end is None:
+            return 0
+        return int((self._end - self._current).total_seconds() / 3600)
+
+    @property
+    def completed_steps(self) -> int:
+        return len(self.result.prices)
+
+    @property
+    def current_time(self) -> datetime | None:
+        if self._current is None:
+            return None
+        return self._current - self._step + self._step
+
+    @property
+    def is_complete(self) -> bool:
+        if self._current is None:
+            return True
+        return self._current >= self._end
+
+    def step(self) -> MarketResult | None:
+        """Run one time step. Returns MarketResult or None if done."""
+        if self._current is None or self._end is None:
+            return None
+        if self._current >= self._end:
+            return None
+
+        ctx = TimeContext.from_datetime(self._current)
+        self._ctx = ctx
+
+        gen_offers = [g.get_offer(ctx) for g in self.generators]
+
+        if self._expected_price is None:
+            self._expected_price = 50.0
+        if self.result.prices:
+            self._expected_price = (
+                self.price_ema_alpha * self.result.prices[-1]
+                + (1 - self.price_ema_alpha) * self._expected_price
+            )
+        expected_price = self._expected_price
+
+        storage_bids = []
+        for s in self.storages:
+            storage_bids.extend(s.get_bids(ctx, expected_price))
+
+        consumer_bids = []
+        for c in self.consumers:
+            consumer_bids.extend(c.get_bids(ctx))
+
+        market_result = self.market.clear(gen_offers, consumer_bids, storage_bids)
+        self._last_result = market_result
+
+        for action in market_result.storage_actions:
+            stor = next(
+                (s for s in self.storages if s.storage_id == action["storage_id"]),
+                None,
+            )
+            if stor:
+                if action["action"] == "charge":
+                    stor.execute_charge(action["quantity_mw"], action["price"])
+                elif action["action"] == "discharge":
+                    stor.execute_discharge(action["quantity_mw"], action["price"])
+
+        for con in self.consumers:
+            allocated = market_result.consumer_allocation.get(con.consumer_id, 0.0)
+            if allocated > 0:
+                con.record_consumption(allocated, market_result.clearing_price)
+            elif market_result.unserved_demand_mw > 0:
+                total_bid = sum(b.quantity_mw for b in con.get_bids(ctx))
+                if total_bid > 0 and allocated == 0:
+                    con.record_blackout()
+
+        self.result.record(
+            self._current, market_result, self.generators, self.consumers, self.storages
+        )
+
+        self._current += self._step
+        return market_result
 
     def print_summary(self) -> None:
         """Print a summary of the simulation results."""
