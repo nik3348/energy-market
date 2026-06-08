@@ -19,10 +19,10 @@ from nodes.generator import SolarGenerator, ThermalGenerator, WindGenerator
 from nodes.storage import BatteryStorage
 from simulation import Simulation
 from utils.demand_profiles import DemandProfile
-from visualization import plot_supply_demand, plot_all
+from visualization import plot_all
 
 
-def build_default_scenario() -> Simulation:
+def build_default_scenario(seed: int | None = None) -> Simulation:
     """Build a realistic default scenario with diverse participants."""
 
     # --- Generators ---
@@ -133,7 +133,7 @@ def build_default_scenario() -> Simulation:
     ]
 
     market = Market(price_cap=1000.0)
-    return Simulation(generators, storages, consumers, market)
+    return Simulation(generators, storages, consumers, market, seed=seed)
 
 
 def main():
@@ -177,12 +177,7 @@ def main():
     )
     args = parser.parse_args()
 
-    sim = build_default_scenario()
-
-    if args.seed is not None:
-        import random
-
-        random.seed(args.seed)
+    sim = build_default_scenario(seed=args.seed)
 
     start = datetime.strptime(args.start, "%Y-%m-%d")
     end = start + timedelta(days=args.days)
@@ -206,6 +201,7 @@ def main():
         plot_all(sim.result)
     elif args.save_plots:
         from visualization import save_all
+
         print("\nSaving visualizations...")
         save_all(sim.result, args.save_plots)
 

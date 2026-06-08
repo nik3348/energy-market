@@ -7,6 +7,7 @@ recording results.
 """
 
 import random
+from collections import defaultdict
 from datetime import datetime, timedelta
 
 from market.market import Market, MarketResult
@@ -25,10 +26,10 @@ class SimulationResult:
         self.total_supply: list[float] = []
         self.total_demand: list[float] = []
         self.unserved_demand: list[float] = []
-        self.generator_outputs: dict[str, list[float]] = {}
-        self.consumer_demands: dict[str, list[float]] = {}
-        self.storage_socs: dict[str, list[float]] = {}
-        self.storage_profits: dict[str, list[float]] = {}
+        self.generator_outputs: dict[str, list[float]] = defaultdict(list)
+        self.consumer_demands: dict[str, list[float]] = defaultdict(list)
+        self.storage_socs: dict[str, list[float]] = defaultdict(list)
+        self.storage_profits: dict[str, list[float]] = defaultdict(list)
 
     def record(
         self,
@@ -46,21 +47,14 @@ class SimulationResult:
         self.unserved_demand.append(result.unserved_demand_mw)
 
         for gen in generators:
-            if gen.generator_id not in self.generator_outputs:
-                self.generator_outputs[gen.generator_id] = []
             dispatched = result.generator_dispatch.get(gen.generator_id, 0.0)
             self.generator_outputs[gen.generator_id].append(dispatched)
 
         for con in consumers:
-            if con.consumer_id not in self.consumer_demands:
-                self.consumer_demands[con.consumer_id] = []
             allocated = result.consumer_allocation.get(con.consumer_id, 0.0)
             self.consumer_demands[con.consumer_id].append(allocated)
 
         for stor in storages:
-            if stor.storage_id not in self.storage_socs:
-                self.storage_socs[stor.storage_id] = []
-                self.storage_profits[stor.storage_id] = []
             self.storage_socs[stor.storage_id].append(stor.soc)
             self.storage_profits[stor.storage_id].append(stor.profit)
 
@@ -80,7 +74,7 @@ class Simulation:
         consumers: list[Consumer],
         market: Market | None = None,
         seed: int | None = None,
-        price_ema_alpha: float = 0.3,  # Smoothing factor for expected price
+        price_ema_alpha: float = 0.3,
     ):
         self.generators = generators
         self.storages = storages
@@ -90,11 +84,71 @@ class Simulation:
         self.price_ema_alpha = price_ema_alpha
         self._expected_price: float | None = None
         self._current: datetime | None = None
-        self._ctx: TimeContext | None = None
+        self._end: datetime | None = None
+        self._step: timedelta = timedelta(hours=1)
         self._last_result: MarketResult | None = None
+        self._storage_by_id = {s.storage_id: s for s in self.storages}
 
         if seed is not None:
             random.seed(seed)
+
+    def _execute_step(self, dt: datetime) -> MarketResult:
+        """Execute one simulation time step at the given datetime."""
+        ctx = TimeContext.from_datetime(dt)
+
+        # 1. Collect generator offers
+        gen_offers = [g.get_offer(ctx) for g in self.generators]
+
+        # 2. Estimate expected price (exponential moving average)
+        if self._expected_price is None:
+            self._expected_price = 50.0
+        if self.result.prices:
+            self._expected_price = (
+                self.price_ema_alpha * self.result.prices[-1]
+                + (1 - self.price_ema_alpha) * self._expected_price
+            )
+        expected_price = self._expected_price
+
+        # 3. Collect storage bids
+        storage_bids = []
+        for s in self.storages:
+            storage_bids.extend(s.get_bids(ctx, expected_price))
+
+        # 4. Collect consumer bids (also track total bid per consumer)
+        consumer_bids = []
+        total_bid_by_consumer: dict[str, float] = {}
+        for c in self.consumers:
+            bids = c.get_bids(ctx)
+            consumer_bids.extend(bids)
+            total_bid_by_consumer[c.consumer_id] = sum(b.quantity_mw for b in bids)
+
+        # 5. Clear the market
+        market_result = self.market.clear(gen_offers, consumer_bids, storage_bids)
+
+        # 6. Execute trades on storage
+        for action in market_result.storage_actions:
+            stor = self._storage_by_id.get(action["storage_id"])
+            if stor:
+                if action["action"] == "charge":
+                    stor.execute_charge(action["quantity_mw"], action["price"])
+                elif action["action"] == "discharge":
+                    stor.execute_discharge(action["quantity_mw"], action["price"])
+
+        # 7. Record consumption
+        for con in self.consumers:
+            allocated = market_result.consumer_allocation.get(con.consumer_id, 0.0)
+            if allocated > 0:
+                con.record_consumption(allocated, market_result.clearing_price)
+            elif market_result.unserved_demand_mw > 0:
+                if total_bid_by_consumer.get(con.consumer_id, 0) > 0 and allocated == 0:
+                    con.record_blackout()
+
+        # 8. Record results
+        self.result.record(
+            dt, market_result, self.generators, self.consumers, self.storages
+        )
+
+        return market_result
 
     def run(
         self,
@@ -108,72 +162,24 @@ class Simulation:
 
         Returns a SimulationResult with the full time series.
         """
+        self._expected_price = None
+        self.result = SimulationResult()
+
         current = start
         step_num = 0
 
         while current < end:
-            ctx = TimeContext.from_datetime(current)
-
-            # 1. Collect generator offers
-            gen_offers = [g.get_offer(ctx) for g in self.generators]
-
-            # 2. Estimate expected price (exponential moving average)
-            if self._expected_price is None:
-                self._expected_price = 50.0  # Initial guess
-            if self.result.prices:
-                self._expected_price = (
-                    self.price_ema_alpha * self.result.prices[-1]
-                    + (1 - self.price_ema_alpha) * self._expected_price
-                )
-            expected_price = self._expected_price
-
-            # 3. Collect storage bids
-            storage_bids = []
-            for s in self.storages:
-                storage_bids.extend(s.get_bids(ctx, expected_price))
-
-            # 4. Collect consumer bids
-            consumer_bids = []
-            for c in self.consumers:
-                consumer_bids.extend(c.get_bids(ctx))
-
-            # 5. Clear the market
-            market_result = self.market.clear(gen_offers, consumer_bids, storage_bids)
-
-            # 6. Execute trades on storage
-            for action in market_result.storage_actions:
-                stor = next(
-                    (s for s in self.storages if s.storage_id == action["storage_id"]),
-                    None,
-                )
-                if stor:
-                    if action["action"] == "charge":
-                        stor.execute_charge(action["quantity_mw"], action["price"])
-                    elif action["action"] == "discharge":
-                        stor.execute_discharge(action["quantity_mw"], action["price"])
-
-            # 7. Record consumption
-            for con in self.consumers:
-                allocated = market_result.consumer_allocation.get(con.consumer_id, 0.0)
-                if allocated > 0:
-                    con.record_consumption(allocated, market_result.clearing_price)
-                elif market_result.unserved_demand_mw > 0:
-                    # Check if this consumer had unserved demand
-                    total_bid = sum(b.quantity_mw for b in con.get_bids(ctx))
-                    if total_bid > 0 and allocated == 0:
-                        con.record_blackout()
-
-            # 8. Record results
-            self.result.record(
-                current, market_result, self.generators, self.consumers, self.storages
-            )
+            self._execute_step(current)
 
             if verbose and step_num % 24 == 0:
+                price = self.result.prices[-1]
+                supply = self.result.total_supply[-1]
+                demand = self.result.total_demand[-1]
                 print(
                     f"  Day {step_num // 24 + 1}: "
-                    f"price=${market_result.clearing_price:.1f}/MWh, "
-                    f"supply={market_result.total_supply_mw:.0f}MW, "
-                    f"demand={market_result.total_demand_mw:.0f}MW"
+                    f"price=${price:.1f}/MWh, "
+                    f"supply={supply:.0f}MW, "
+                    f"demand={demand:.0f}MW"
                 )
 
             current += step
@@ -181,7 +187,9 @@ class Simulation:
 
         return self.result
 
-    def reset(self, start: datetime, end: datetime, step: timedelta = timedelta(hours=1)) -> None:
+    def reset(
+        self, start: datetime, end: datetime, step: timedelta = timedelta(hours=1)
+    ) -> None:
         """Re-initialize simulation to run from start to end."""
         self._expected_price = None
         self._current = start
@@ -202,13 +210,11 @@ class Simulation:
 
     @property
     def current_time(self) -> datetime | None:
-        if self._current is None:
-            return None
-        return self._current - self._step + self._step
+        return self._current
 
     @property
     def is_complete(self) -> bool:
-        if self._current is None:
+        if self._current is None or self._end is None:
             return True
         return self._current >= self._end
 
@@ -219,57 +225,10 @@ class Simulation:
         if self._current >= self._end:
             return None
 
-        ctx = TimeContext.from_datetime(self._current)
-        self._ctx = ctx
-
-        gen_offers = [g.get_offer(ctx) for g in self.generators]
-
-        if self._expected_price is None:
-            self._expected_price = 50.0
-        if self.result.prices:
-            self._expected_price = (
-                self.price_ema_alpha * self.result.prices[-1]
-                + (1 - self.price_ema_alpha) * self._expected_price
-            )
-        expected_price = self._expected_price
-
-        storage_bids = []
-        for s in self.storages:
-            storage_bids.extend(s.get_bids(ctx, expected_price))
-
-        consumer_bids = []
-        for c in self.consumers:
-            consumer_bids.extend(c.get_bids(ctx))
-
-        market_result = self.market.clear(gen_offers, consumer_bids, storage_bids)
-        self._last_result = market_result
-
-        for action in market_result.storage_actions:
-            stor = next(
-                (s for s in self.storages if s.storage_id == action["storage_id"]),
-                None,
-            )
-            if stor:
-                if action["action"] == "charge":
-                    stor.execute_charge(action["quantity_mw"], action["price"])
-                elif action["action"] == "discharge":
-                    stor.execute_discharge(action["quantity_mw"], action["price"])
-
-        for con in self.consumers:
-            allocated = market_result.consumer_allocation.get(con.consumer_id, 0.0)
-            if allocated > 0:
-                con.record_consumption(allocated, market_result.clearing_price)
-            elif market_result.unserved_demand_mw > 0:
-                total_bid = sum(b.quantity_mw for b in con.get_bids(ctx))
-                if total_bid > 0 and allocated == 0:
-                    con.record_blackout()
-
-        self.result.record(
-            self._current, market_result, self.generators, self.consumers, self.storages
-        )
-
+        result = self._execute_step(self._current)
+        self._last_result = result
         self._current += self._step
-        return market_result
+        return result
 
     def print_summary(self) -> None:
         """Print a summary of the simulation results."""

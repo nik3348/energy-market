@@ -4,17 +4,24 @@ DashboardWindow — main PyQt window with control panel and simulation graphs.
 
 from datetime import datetime, timedelta
 
-from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QSlider, QLabel, QGroupBox, QScrollArea, QFrame,
-    QTabWidget,
-)
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont
+from PyQt5.QtWidgets import (
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QSlider,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
 from main import build_default_scenario
-from ui.simulation_thread import SimulationThread, SimState
-from ui.plots import SupplyDemandPlot, PricePlot, GeneratorOutputPlot, StoragePlot
+from ui.plots import GeneratorOutputPlot, PricePlot, StoragePlot, SupplyDemandPlot
+from ui.simulation_thread import SimState, SimulationThread
 
 
 class DashboardWindow(QFrame):
@@ -32,6 +39,11 @@ class DashboardWindow(QFrame):
         self._plot_price = PricePlot()
         self._plot_generators = GeneratorOutputPlot()
         self._plot_storage = StoragePlot()
+
+        self._latest_result = None
+        self._update_timer = QTimer(self)
+        self._update_timer.setInterval(200)  # 5 updates/sec
+        self._update_timer.timeout.connect(self._update_plots)
 
         self._setup_ui()
         self._connect_signals()
@@ -170,16 +182,14 @@ class DashboardWindow(QFrame):
         self._plot_storage.reset_view()
 
     def _on_step_complete(self, result) -> None:
-        self._plot_supply.update_data(result)
-        self._plot_price.update_data(result)
-        self._plot_generators.update_data(result)
-        self._plot_storage.update_data(result)
+        self._latest_result = result
 
     def _on_status_update(self, status: str) -> None:
         self._progress_label.setText(status)
 
     def _on_simulation_complete(self) -> None:
         self._set_state(SimState.STOPPED)
+        self._update_plots()
         self._status_label.setText("Complete")
 
     def _set_state(self, state: SimState) -> None:
@@ -190,36 +200,60 @@ class DashboardWindow(QFrame):
             self._btn_stop.setEnabled(False)
             self._status_label.setText("Ready")
             self._hide_all_toolbars()
+            self._update_timer.stop()
         elif state == SimState.RUNNING:
             self._btn_play.setText("Pause")
             self._btn_play.setEnabled(True)
             self._btn_stop.setEnabled(True)
             self._status_label.setText("Running...")
             self._hide_all_toolbars()
+            self._update_timer.start()
         elif state == SimState.PAUSED:
             self._btn_play.setText("Resume")
             self._btn_play.setEnabled(True)
             self._btn_stop.setEnabled(True)
             self._status_label.setText("Paused")
             self._show_all_toolbars()
+            self._update_timer.stop()
+            self._update_plots()
         elif state == SimState.STOPPED:
             self._btn_play.setText("Play")
             self._btn_play.setEnabled(True)
             self._btn_stop.setEnabled(False)
             self._status_label.setText("Stopped")
             self._show_all_toolbars()
+            self._update_timer.stop()
+            self._update_plots()
 
     def _show_all_toolbars(self) -> None:
-        for plot in [self._plot_supply, self._plot_price,
-                     self._plot_generators, self._plot_storage]:
+        for plot in [
+            self._plot_supply,
+            self._plot_price,
+            self._plot_generators,
+            self._plot_storage,
+        ]:
             plot.show_toolbar()
 
     def _hide_all_toolbars(self) -> None:
-        for plot in [self._plot_supply, self._plot_price,
-                     self._plot_generators, self._plot_storage]:
+        for plot in [
+            self._plot_supply,
+            self._plot_price,
+            self._plot_generators,
+            self._plot_storage,
+        ]:
             plot.hide_toolbar()
 
+    def _update_plots(self) -> None:
+        if self._latest_result is None:
+            return
+        result = self._latest_result
+        self._plot_supply.update_data(result)
+        self._plot_price.update_data(result)
+        self._plot_generators.update_data(result)
+        self._plot_storage.update_data(result)
+
     def _clear_plots(self) -> None:
+        self._latest_result = None
         self._plot_supply.clear()
         self._plot_price.clear()
         self._plot_generators.clear()

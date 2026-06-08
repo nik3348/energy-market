@@ -27,16 +27,6 @@ class MarketResult:
     consumer_allocation: dict[str, float]  # consumer_id -> allocated MW
     storage_actions: list[dict]  # Details of storage charge/discharge
 
-    @property
-    def price(self) -> float:
-        """Alias for clearing_price."""
-        return self.clearing_price
-
-    @property
-    def surplus_mw(self) -> float:
-        """Excess supply that went unused."""
-        return max(0, self.total_supply_mw - self.total_demand_mw)
-
 
 @dataclass
 class _SortableSell:
@@ -56,7 +46,6 @@ class _SortableBuy:
     source_type: str  # "consumer" or "storage"
     quantity_mw: float
     price: float
-    consumer_id_for_tracking: str = ""  # original consumer for demand tracking
 
 
 class Market:
@@ -125,7 +114,6 @@ class Market:
                         source_type="consumer",
                         quantity_mw=bid.quantity_mw,
                         price=bid.max_price,
-                        consumer_id_for_tracking=bid.consumer_id,
                     )
                 )
 
@@ -218,8 +206,9 @@ class Market:
         for buy, qty in cleared_buys:
             total_demand += qty
             if buy.source_type == "consumer":
-                cid = buy.consumer_id_for_tracking or buy.source_id
-                consumer_allocation[cid] = consumer_allocation.get(cid, 0.0) + qty
+                consumer_allocation[buy.source_id] = (
+                    consumer_allocation.get(buy.source_id, 0.0) + qty
+                )
             elif buy.source_type == "storage":
                 raw_storage_actions.append(
                     {
@@ -235,27 +224,12 @@ class Market:
         # If both actions cleared, net them: keep only the dominant direction.
         storage_actions = self._resolve_storage_conflicts(raw_storage_actions)
 
-        # Adjust totals after conflict resolution
-        for action in storage_actions:
-            if action["action"] == "discharge":
-                # Already counted in total_supply (no change needed unless netted)
-                pass
-            elif action["action"] == "charge":
-                # Already counted in total_demand (no change needed unless netted)
-                pass
-
         # Recalculate totals after conflict resolution
         final_supply = sum(
-            q
-            for a in storage_actions
-            if a["action"] == "discharge"
-            for q in [a["quantity_mw"]]
+            a["quantity_mw"] for a in storage_actions if a["action"] == "discharge"
         ) + sum(generator_dispatch.values())
         final_demand = sum(
-            q
-            for a in storage_actions
-            if a["action"] == "charge"
-            for q in [a["quantity_mw"]]
+            a["quantity_mw"] for a in storage_actions if a["action"] == "charge"
         ) + sum(consumer_allocation.values())
 
         # Calculate unserved demand
